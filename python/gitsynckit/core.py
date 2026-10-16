@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-__version__ = "0.2.0"
+__version__ = "0.2.2"
 
 BRANCH_DEFAULT = "main"
 
@@ -722,13 +722,17 @@ class GitSyncKit:
                 "message": f"推送失败：{chr(10)}{err or out}",
             }
 
+        # files 数的是 git status --porcelain 的**条目数**，不是文件数：一个未跟踪
+        # 目录只占一行，却可能含十几个文件。字段名保留（改名是破坏性变更），
+        # 文案一律说「项」，并补一个同义的 entries 让含义自解释。
         return {
             "ok": True,
             "committed": committed,
             "files": len(dirty),
+            "entries": len(dirty),
             "branch": branch,
             "message": (
-                f"已提交 {len(dirty)} 个文件并推送到 origin/{branch}。"
+                f"已提交 {len(dirty)} 项改动并推送到 origin/{branch}。"
                 if committed
                 else f"没有本地改动，已确认 origin/{branch} 是最新的。"
             ),

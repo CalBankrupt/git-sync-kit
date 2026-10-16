@@ -22,7 +22,7 @@
 
 Set-StrictMode -Version Latest
 
-$script:KitVersion    = '0.2.0'
+$script:KitVersion    = '0.2.2'
 $script:BranchDefault = 'main'
 $script:Modes         = @('update', 'sync')
 $script:DiffLimit     = 100
@@ -151,15 +151,25 @@ function Get-GitSyncDirtyFiles {
         PropertyNotFoundException。@() 正好把三种形态都归一成数组
         （$null → 0 个、标量 → 1 个、数组原样）。
 
-        踩过的坑：这里曾经写过 `return ,$lines` 想靠逗号保住数组 —— 但
-        $lines 本身已经是数组时，逗号会额外包一层变成 @(@())，调用方
-        .Count 得到 1，于是「干净的仓库」也会去执行 git add/commit 并报
-        「git commit 失败」。保持函数返回普通数组、把规范化交给调用方。
+        踩过的坑（两轮）：
+        1. 这里曾经写过 `return ,$lines` 想靠逗号保住数组 —— 但 $lines 本身已是
+           数组时，逗号会额外包一层变成 @(@())，调用方 .Count 得到 1。
+        2. 后来改成 `return ,@(...)` **仍然是错的**（2026-10-17 实测）：
+           `,@()` 只在**赋值**时保住数组，在 `return` 里会多包一层 —— 实测
+             干净仓库 -> @() 后 .Count = 1
+             一项改动 -> @() 后 .Count = 2
+             两项以上 -> @() 后 .Count = 1   ← 内容是对的，计数是错的
+           症状：改动一项时文案说「2 项」、改动多项时说「1 项」，而且
+           `foreach` 拿到的整层嵌套数组只会迭代一次（冲突检测因此漏掉工作区的
+           改动）。**只在「恰好一项」时看起来像对的**，极难倒推。
+
+        正确写法：这里返回**普通数组**，让 PowerShell 的返回管线照常展开
+        （空→$null、一项→标量、多项→数组），把归一化交给调用方的 @()。
     #>
     param([Parameter(Mandatory)][string]$Root)
     $r = Invoke-GitCapture -Root $Root -GitArgs @('status', '--porcelain')
     if ($r.Code -ne 0 -or -not $r.Out) { return @() }
-    return ,@($r.Out -split "`r?`n" | Where-Object { $_ })
+    return @($r.Out -split "`r?`n" | Where-Object { $_ })
 }
 
 # ---------------------------------------------------------------------------
@@ -206,8 +216,10 @@ function Get-GitSyncConflict {
         foreach ($p in ($m.Out -split "`r?`n")) { if ($p) { $mine[$p.Trim()] = $true } }
     }
 
-    # 工作区里未提交的也算「本地改过」
-    foreach ($line in (Get-GitSyncDirtyFiles -Root $Root)) {
+    # 工作区里未提交的也算「本地改过」。
+    # 必须 @() 包一层：函数走返回管线，空/一项/多项分别是 $null/标量/数组，
+    # 而裸的嵌套数组 foreach 只会迭代一次（漏掉后面的改动文件，冲突就检不出来）。
+    foreach ($line in @(Get-GitSyncDirtyFiles -Root $Root)) {
         $text = $(if ($line.Length -gt 3) { $line.Substring(3).Trim() } else { '' })
         if ($text -match ' -> ') { $text = ($text -split ' -> ')[-1] }
         if ($text) { $mine[$text.Trim('"')] = $true }
@@ -507,7 +519,7 @@ function Invoke-GitSyncInstall {
     }
 
     if (Test-GitSyncDirty -Root $Root) {
-        $files = Get-GitSyncDirtyFiles -Root $Root
+        $files = @(Get-GitSyncDirtyFiles -Root $Root)
         $shown = ($files | Select-Object -First 10 | ForEach-Object { "  $_" }) -join "`n"
         $more = $(if ($files.Count -gt 10) { "`n  …还有 $($files.Count - 10) 项" } else { '' })
         return [pscustomobject]@{
@@ -702,9 +714,13 @@ function Invoke-GitSyncPush {
     }
 
     return [pscustomobject]@{
-        ok = $true; committed = $committed; files = $dirty.Count; branch = $Branch
+        # files 数的是 git status --porcelain 的**条目数**，不是文件数：一个未跟踪
+        # 目录只占一行，却可能含十几个文件。字段名保留（改名是破坏性变更），
+        # 文案一律说「项」，并补一个同义的 entries 让含义自解释。
+        ok = $true; committed = $committed; files = $dirty.Count; entries = $dirty.Count
+        branch = $Branch
         message = $(if ($committed) {
-            "已提交 $($dirty.Count) 个文件并推送到 origin/$Branch。"
+            "已提交 $($dirty.Count) 项改动并推送到 origin/$Branch。"
         } else {
             "没有本地改动，已确认 origin/$Branch 是最新的。"
         })

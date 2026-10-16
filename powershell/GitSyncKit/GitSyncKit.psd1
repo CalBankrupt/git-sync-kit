@@ -1,6 +1,6 @@
-﻿@{
+@{
     RootModule        = 'GitSyncKit.psm1'
-    ModuleVersion     = '0.1.0'
+    ModuleVersion     = '0.2.2'
     GUID              = 'a7c3e1f2-5b84-4d61-9e07-2f8d4c6b1a35'
     Author            = 'CalBankrupt'
     CompanyName       = 'CalBankrupt'

@@ -19,7 +19,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlin
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
-export const VERSION = '0.1.0'
+export const VERSION = '0.2.2'
 export const BRANCH_DEFAULT = 'main'
 export const TRIAL_SUFFIX = '*'
 export const DIFF_LIMIT = 100
@@ -559,9 +559,12 @@ export class GitSyncKit {
       return { ok: false, committed, message: `推送失败：\n${p.err || p.out}` }
     }
     return {
-      ok: true, committed, files: dirty.length, branch,
+      // files 数的是 git status --porcelain 的**条目数**，不是文件数：一个未跟踪
+      // 目录只占一行，却可能含十几个文件。字段名保留（改名是破坏性变更），
+      // 文案一律说「项」，并补一个同义的 entries 让含义自解释。
+      ok: true, committed, files: dirty.length, entries: dirty.length, branch,
       message: committed
-        ? `已提交 ${dirty.length} 个文件并推送到 origin/${branch}。`
+        ? `已提交 ${dirty.length} 项改动并推送到 origin/${branch}。`
         : `没有本地改动，已确认 origin/${branch} 是最新的。`,
     }
   }
