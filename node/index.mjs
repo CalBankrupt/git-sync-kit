@@ -178,28 +178,24 @@ export class GitSyncKit {
   async _remoteViaGit() {
     const f = await runGit(this.root, ['fetch', '--quiet', 'origin', this.branch], 120000)
     if (f.code !== 0) {
-      return { version: null, behind: 0, error: f.err || f.out || 'git fetch 失败', mode: 'release' }
+      return { version: null, behind: 0, error: f.err || f.out || 'git fetch 失败' }
     }
-    const s = await runGit(this.root, ['show', `origin/${this.branch}:VERSION`])
+    const s = await runGit(this.root, ['show', 'origin/' + this.branch + ':VERSION'])
     if (s.code !== 0 || !s.out) {
       // runGit 把 stdout 和 stderr 一起写进同一个临时文件，所以真正的错误在
       // out 里（err 只在 spawn 失败时才有值）。fetch 分支已经这么兜底了，这里
-      // 漏了 —— 于是用户看到「origin/main 上没有 VERSION 文件」，而 git 其实
+      // 漏过 —— 于是用户看到「origin/main 上没有 VERSION 文件」，而 git 其实
       // 说的是 fatal: path 'VERSION' does not exist in 'origin/main'。
-      // Python 那份读的是分离的 stderr，拿到的就是 git 的原话。
-      return {
-        version: null, behind: 0, mode: 'release',
-        error: s.err || s.out || `origin/${this.branch} 上没有 VERSION 文件`,
-      }
+      const name = 'origin/' + this.branch + ' 上没有 VERSION 文件'
+      return { version: null, behind: 0, error: s.err || s.out || name }
     }
     const raw = s.out.split(/\r?\n/)[0].trim()
-    const mode = raw.endsWith(TRIAL_SUFFIX) ? 'trial' : 'release'
-    const version = raw.replace(/\*+$/, '').trim()
+    const version = raw.replace(/^[vV]/, '').trim()
 
     let behind = 0
     const b = await runGit(this.root, ['rev-list', '--count', `HEAD..origin/${this.branch}`])
     if (b.code === 0 && /^\d+$/.test(b.out)) behind = Number(b.out)
-    return { version, behind, error: '', mode }
+    return { version, behind, error: '' }
   }
 
   async _remoteViaHttp() {
@@ -249,15 +245,64 @@ export class GitSyncKit {
     }
   }
 
+  async _aheadCount() {
+    const r = await runGit(this.root, ['rev-list', '--count',
+      'origin/' + this.branch + '..HEAD'])
+    return (r.code === 0 && /^\d+$/.test(r.out)) ? Number(r.out) : 0
+  }
+
+  /**
+   * 冲突清单（SPEC 第 6 节）：以 merge-base 为基准，本地改过的文件与远端改过的
+   * 文件取交集。**只读，不动任何文件。**
+   *
+   * 没有分叉点就不存在冲突 —— 那种情况只有「落后」或「领先」。
+   */
+  async conflict() {
+    const empty = { count: 0, files: [] }
+    const mb = await runGit(this.root, ['merge-base', 'HEAD', 'origin/' + this.branch])
+    if (mb.code !== 0 || !mb.out) return empty
+    const base = mb.out.split(/\r?\n/)[0].trim()
+    if (!base) return empty
+
+    const mine = new Set()
+    const m = await runGit(this.root, ['diff', '--name-only', base, 'HEAD'])
+    if (m.code === 0) {
+      for (const p of m.out.split(/\r?\n/)) if (p.trim()) mine.add(p.trim())
+    }
+
+    // 工作区里未提交的也算「本地改过」
+    for (const line of await this.dirtyFiles()) {
+      let text = line.length > 3 ? line.slice(3).trim() : ''
+      if (text.includes(' -> ')) text = text.split(' -> ').pop()
+      if (text) mine.add(text.replace(/^"|"$/g, ''))
+    }
+
+    const common = []
+    const t = await runGit(this.root, ['diff', '--name-only', base, 'origin/' + this.branch])
+    if (t.code === 0) {
+      for (const raw of t.out.split(/\r?\n/)) {
+        const p = raw.trim()
+        if (p && mine.has(p)) common.push(p)
+      }
+    }
+    common.sort()
+    return {
+      count: common.length,
+      files: common.map((p) => ({ path: p, reason: 'both-modified' })),
+    }
+  }
+
   // ---- 检查（SPEC 5.1）----
   async check() {
+    const NL = String.fromCharCode(10)
     const rep = {
-      ok: true, state: 'unknown', mode: 'release',
+      ok: true, state: 'unknown', workMode: this.mode,
       local: this.localVersion(), remote: null,
-      has_update: false, behind: 0, dirty: false,
+      has_update: false, behind: 0, ahead: 0, dirty: false,
       is_git: this.isGitRepo(), channel: 'none',
       branch: this.branch, message: '', error: null,
-      can_install: false, can_select: false, diff: null,
+      can_install: false, can_select: false, can_push: false,
+      diff: null, conflict: null,
     }
 
     if (rep.is_git) {
@@ -266,7 +311,6 @@ export class GitSyncKit {
       if (remote.version) {
         rep.remote = remote.version
         rep.behind = remote.behind
-        rep.mode = remote.mode
         rep.channel = 'git'
       } else {
         const http = await this._remoteViaHttp()
@@ -287,47 +331,82 @@ export class GitSyncKit {
       if (http.version) {
         rep.remote = http.version
         rep.channel = 'http'
+        rep.has_update = isNewer(http.version, rep.local)
+        rep.state = rep.has_update ? 'stale' : 'latest'
+        rep.message = rep.has_update
+          ? '发现新版本 ' + rep.remote + '（当前 ' + rep.local + '）。此模式下只能查看，无法更新。'
+          : '已是最新版本（' + rep.local + '）。'
       } else {
         rep.ok = false
         rep.state = 'error'
-        rep.error = `不是 git 仓库，且 HTTP 查询失败：${http.error}`
+        rep.error = '不是 git 仓库，且 HTTP 查询失败：' + http.error
         rep.message = rep.error
-        return rep
-      }
-    }
-
-    // ---- 试验版：只看有没有差异 ----
-    if (rep.mode === 'trial' && rep.channel === 'git') {
-      const d = await this.diff()
-      rep.diff = d
-      rep.has_update = d.count > 0
-      if (d.count > 0) {
-        rep.state = 'trial'
-        rep.can_select = true
-        rep.message = `试验版（远端 VERSION 带 ${TRIAL_SUFFIX}）：${d.count} 个文件与远端有差异。\n`
-          + '这种情况不会自动覆盖 —— 请挑要应用的文件，或先看清单再决定。'
-      } else {
-        rep.state = 'latest'
-        rep.message = `试验版（${rep.local}），工作区与远端没有差异。`
       }
       return rep
     }
 
-    // ---- 正式版：版本号变大才算有更新 ----
-    rep.has_update = Boolean(rep.remote && isNewer(rep.remote, rep.local))
+    // 冲突只可能出现在真分叉上（本地和远端各有提交）
+    if (rep.channel === 'git') {
+      rep.ahead = await this._aheadCount()
+      if (rep.behind > 0 && rep.ahead > 0) {
+        rep.conflict = await this.conflict()
+      }
+    }
+    const hasConflict = Boolean(rep.conflict && rep.conflict.count > 0)
+
     if (rep.error) {
       rep.state = 'unknown'
-    } else if (rep.has_update) {
-      rep.state = 'stale'
-      const tail = rep.behind ? `，落后 ${rep.behind} 个提交` : ''
-      rep.message = `发现新版本 ${rep.remote}（当前 ${rep.local}${tail}）。`
-    } else {
-      rep.state = 'latest'
-      rep.message = `已是最新版本（${rep.local}）。`
+      rep.message = rep.error
+      return rep
     }
 
-    // SPEC 5.1：试验版永远不给一键更新
-    rep.can_install = rep.channel === 'git' && rep.has_update && !rep.dirty && rep.mode === 'release'
+    // ---- 按工作模式判定（SPEC 第 2 节）----
+    if (this.mode === 'sync') {
+      if (rep.channel === 'git' && rep.behind > 0) {
+        rep.has_update = true
+        rep.state = 'stale'
+        rep.message = '远端有 ' + rep.behind + ' 个提交未拉取。'
+      } else if (rep.channel === 'git' && rep.ahead > 0) {
+        rep.state = 'ahead'
+        rep.message = '本地有 ' + rep.ahead + ' 个提交未推送（工作区'
+          + (rep.dirty ? '有' : '无') + '未提交改动）。'
+      } else if (rep.dirty) {
+        rep.state = 'ahead'
+        rep.message = '工作区有未提交的改动，可以上传。'
+      } else {
+        rep.state = 'latest'
+        rep.message = '已同步（' + rep.local + '）。'
+      }
+    } else {
+      rep.has_update = Boolean(rep.remote && isNewer(rep.remote, rep.local))
+      if (rep.has_update) {
+        rep.state = 'stale'
+        const tail = rep.behind ? '，落后 ' + rep.behind + ' 个提交' : ''
+        rep.message = '发现新版本 ' + rep.remote + '（当前 ' + rep.local + tail + '）。'
+      } else {
+        rep.state = 'latest'
+        rep.message = '已是最新版本（' + rep.local + '）。'
+      }
+    }
+
+    // ---- 差异清单：只要有得拉就算出来，与状态无关 ----
+    if (rep.channel === 'git' && rep.behind > 0) {
+      rep.diff = await this.diff()
+      if (this.mode === 'update' && rep.state === 'latest') {
+        rep.message += '远端另有 ' + rep.behind + ' 个提交未升版 —— 打开窗口可以看差异。'
+      }
+    }
+
+    if (hasConflict) {
+      rep.message += NL + '注意：' + rep.conflict.count
+        + ' 个文件本地和远端都改过，拉取与上传都已停用，请先手动处理。'
+    }
+
+    // SPEC 5.1：三个能力字段
+    rep.can_install = rep.channel === 'git' && rep.has_update && !rep.dirty && !hasConflict
+    rep.can_select = rep.channel === 'git' && Boolean(rep.diff && rep.diff.count > 0)
+    rep.can_push = this.mode === 'sync' && rep.channel === 'git' && !hasConflict
+      && (rep.ahead > 0 || rep.dirty)
     return rep
   }
 
