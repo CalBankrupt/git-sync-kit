@@ -1,4 +1,4 @@
-﻿#Requires -Version 7.0
+#Requires -Version 7.0
 <#
     git-sync-kit —— PowerShell 实现
 
@@ -498,6 +498,19 @@ function Invoke-GitSyncInstall {
         }
     }
 
+    # SPEC 7.5：有冲突时拒绝拉取。带着分叉去快进合并，git 只会给一句和「冲突」
+    # 无关的报错；不如在这里就把它翻译成人话。
+    $c = Get-GitSyncConflict -Root $Root -Branch $Branch
+    if ($c.count -gt 0) {
+        $names = ($c.files | Select-Object -First 10 | ForEach-Object { $_.path }) -join '、'
+        return [pscustomobject]@{
+            ok = $false; conflict = $true
+            files = @($c.files | ForEach-Object { $_.path })
+            message = "有 $($c.count) 个文件本地和远端都改过，已拒绝更新：$names$($script:NL)" +
+                      "请先手动处理（merge、或选一边）再试。"
+        }
+    }
+
     $before = (Invoke-GitCapture -Root $Root -GitArgs @('rev-parse', '--short', 'HEAD')).Out
     $p = Invoke-GitCapture -Root $Root -GitArgs @('pull', '--ff-only', 'origin', $Branch) -TimeoutSeconds 300
     if ($p.Code -ne 0) {
@@ -609,16 +622,36 @@ function Invoke-GitSyncApply {
 function Invoke-GitSyncPush {
     <#
         提交并推送本地改动。与 Invoke-GitSyncInstall 对称。
+
+        SPEC 7.7：调用方必须先列出待提交条目、由人确认；这里再查一次模式与冲突，
+        免得有人绕过界面直接调。
     #>
     [CmdletBinding()]
     param(
         [string]$Root = (Get-Location).Path,
         [string]$Branch = $script:BranchDefault,
-        [string]$Message = ''
+        [string]$Message = '',
+        [ValidateSet('update', 'sync')][string]$Mode = 'update'
     )
+
+    if ($Mode -ne 'sync') {
+        return [pscustomobject]@{ ok = $false; message = '当前是单向更新模式，上传入口没开。' }
+    }
 
     if (-not (Test-Path -LiteralPath (Join-Path $Root '.git'))) {
         return [pscustomobject]@{ ok = $false; message = '当前目录不是 git 仓库，无法上传。' }
+    }
+
+    # SPEC 7.5：有冲突时拒绝推送
+    $cf = Get-GitSyncConflict -Root $Root -Branch $Branch
+    if ($cf.count -gt 0) {
+        $names = ($cf.files | Select-Object -First 10 | ForEach-Object { $_.path }) -join '、'
+        return [pscustomobject]@{
+            ok = $false; conflict = $true
+            files = @($cf.files | ForEach-Object { $_.path })
+            message = "有 $($cf.count) 个文件本地和远端都改过，已拒绝推送：$names$($script:NL)" +
+                      "请先手动处理（merge、或选一边）再试。"
+        }
     }
 
     $dirty = Get-GitSyncDirtyFiles -Root $Root

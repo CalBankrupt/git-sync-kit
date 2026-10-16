@@ -422,7 +422,19 @@ export class GitSyncKit {
       return {
         ok: false, dirty: true,
         message: '本地有未提交的改动，已拒绝更新 —— 以免覆盖你正在改的东西。\n'
-          + `${shown}${more}\n请先提交（或用 git stash 暂存）后再试。`,
+          + shown + more + '\n请先提交（或用 git stash 暂存）后再试。',
+      }
+    }
+
+    // SPEC 7.5：有冲突时拒绝拉取。带着分叉去快进合并，git 只会给一句和「冲突」
+    // 无关的报错；不如在这里就把它翻译成人话。
+    const c = await this.conflict()
+    if (c.count) {
+      const names = c.files.slice(0, 10).map((f) => f.path).join('、')
+      return {
+        ok: false, conflict: true, files: c.files.map((f) => f.path),
+        message: '有 ' + c.count + ' 个文件本地和远端都改过，已拒绝更新：' + names
+          + '\n请先手动处理（merge、或选一边）再试。',
       }
     }
 
@@ -508,8 +520,24 @@ export class GitSyncKit {
 
   // ---- 上传（仅 sync 模式）----
   async push(message = '') {
+    // SPEC 7.7：调用方必须先列出待提交条目、由人确认；这里再查一次模式与冲突，
+    // 免得有人绕过界面直接调。
+    if (this.mode !== 'sync') {
+      return { ok: false, message: '当前是单向更新模式，上传入口没开。' }
+    }
     if (!this.isGitRepo()) {
       return { ok: false, message: '当前目录不是 git 仓库，无法上传。' }
+    }
+
+    // SPEC 7.5：有冲突时拒绝推送
+    const cf = await this.conflict()
+    if (cf.count) {
+      const names = cf.files.slice(0, 10).map((f) => f.path).join('、')
+      return {
+        ok: false, conflict: true, files: cf.files.map((f) => f.path),
+        message: '有 ' + cf.count + ' 个文件本地和远端都改过，已拒绝推送：' + names
+          + '\n请先手动处理（merge、或选一边）再试。',
+      }
     }
     const b = await runGit(this.root, ['rev-parse', '--abbrev-ref', 'HEAD'])
     const branch = b.out || this.branch
