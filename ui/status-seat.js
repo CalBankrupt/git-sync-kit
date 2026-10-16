@@ -10,7 +10,7 @@
  *     anchor: '#my-button',            // 克隆哪个已有按钮（推荐：能继承宿主样式）
  *     tooltipPrefix: '我的项目：',      // 可选
  *     onActivate: async (state) => {   // 点击时调用，返回新的状态对象
- *       if (state === 'stale' || state === 'trial') { openUpdateWindow(); return null; }
+ *       if (state === 'stale' || state === 'ahead') { openUpdateWindow(); return null; }
  *       return await myApi.check();    // { state, message, diff }
  *     },
  *   });
@@ -26,12 +26,11 @@ const SHAPES = {
     '<path d="M21 3v6h-6"/>',
   ],
   latest: ['<path d="M20 6L9 17l-5-5"/>'],
-  stale: ['<path d="M12 19V5"/>', '<path d="M5 12l7-7 7 7"/>'],
-  // 问号 = 试验版有差异，要人来定
-  trial: [
-    '<path d="M9.1 9a3 3 0 1 1 4.2 2.7c-.8.4-1.3 1.1-1.3 2"/>',
-    '<path d="M12 17.5h.01"/>',
-  ],
+  // 箭头方向 = 数据流向：↓ 往本地拿，↑ 往外送（SPEC 0.2.0 第 4 节）。
+  // 之前的约定是反的 —— 用 ↑ 表示「有新版本可下载」，每次都得在脑子里转一道。
+  stale: ['<path d="M12 5v14"/>', '<path d="M5 12l7 7 7-7"/>'],
+  // ↑ = 本地有东西待上传（只有 sync 工作模式会出现）
+  ahead: ['<path d="M12 19V5"/>', '<path d="M5 12l7-7 7 7"/>'],
   error: [
     '<path d="M21 12a9 9 0 1 1-3.2-6.9"/>',
     '<path d="M21 3v6h-6"/>',
@@ -47,7 +46,7 @@ const TITLES = {
   busy: '正在检查更新… / Checking for updates...',
   latest: '已是最新版本 / Up to date',
   stale: '有新版本可用，点击查看 / Update available, click to review',
-  trial: '试验版有差异，点击查看清单（不会改动文件） / Trial build differs, click to review (read-only)',
+  ahead: '本地有新改动待上传，点击查看 / Local changes to upload, click to review',
   unknown: '已检查，但无法判断是否有新版本 / Checked, cannot tell',
   error: '检查失败，点击重试 / Check failed, click to retry',
 }
@@ -58,7 +57,7 @@ const COLORS = {
   busy: '#93c5fd',
   latest: '#86efac',
   stale: '#60a5fa',
-  trial: '#fbbf24',
+  ahead: '#fbbf24',       // 琥珀：有东西正要送出去，值得看一眼
   unknown: '',
   error: '#fca5a5',
 }
