@@ -1,0 +1,23 @@
+# 默认按文本处理，检出时统一 LF
+* text=auto eol=lf
+
+# PowerShell
+#
+# .ps1 / .psm1 / .psd1 用 CRLF。带中文的模块必须以 UTF-8 BOM 保存 ——
+# Windows PowerShell 5.1 按 ANSI 代码页读取无 BOM 的脚本，中文会乱码并可能
+# 破坏解析（本项目在 run.bat 上踩过同样的坑，那次连行结构都被打乱了）。
+#
+# 这里刻意不用 working-tree-encoding=UTF-8-BOM：BOM 由文件本身携带更直观，
+# 混用两者会让 git 认为工作区与索引永远不一致。
+*.ps1   text eol=crlf
+*.psm1  text eol=crlf
+*.psd1  text eol=crlf
+
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.sh    text eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.ico binary
