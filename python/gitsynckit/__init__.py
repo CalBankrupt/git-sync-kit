@@ -20,6 +20,10 @@
 """
 from .core import (
     BRANCH_DEFAULT,
+    MODES,
+    MODE_SYNC,
+    MODE_UPDATE,
+    ConflictEntry,
     DiffEntry,
     GitSyncKit,
     Report,
@@ -31,7 +35,11 @@ __all__ = [
     "GitSyncKit",
     "Report",
     "DiffEntry",
+    "ConflictEntry",
     "find_repo",
     "BRANCH_DEFAULT",
+    "MODE_UPDATE",
+    "MODE_SYNC",
+    "MODES",
     "__version__",
 ]
