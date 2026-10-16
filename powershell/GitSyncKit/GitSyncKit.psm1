@@ -137,10 +137,29 @@ function Test-GitSyncDirty {
 }
 
 function Get-GitSyncDirtyFiles {
+    <#
+        未提交的条目（每行一条 `git status --porcelain` 输出）。
+
+        调用方**必须**用 @() 包一层再取 .Count，例如：
+            $dirty = @(Get-GitSyncDirtyFiles -Root $Root)
+            if ($dirty.Count -gt 0) { ... }
+
+        为什么必须这样：PowerShell 的返回管线会把数组展开，同一个函数对
+        不同仓库会返回三种形态 —— 空数组会被展开成 $null、单个元素变成标量
+        字符串、两个以上才是数组。而本模块是严格模式（文件头
+        Set-StrictMode -Version Latest），$null.Count 和 字符串.Count 都会抛
+        PropertyNotFoundException。@() 正好把三种形态都归一成数组
+        （$null → 0 个、标量 → 1 个、数组原样）。
+
+        踩过的坑：这里曾经写过 `return ,$lines` 想靠逗号保住数组 —— 但
+        $lines 本身已经是数组时，逗号会额外包一层变成 @(@())，调用方
+        .Count 得到 1，于是「干净的仓库」也会去执行 git add/commit 并报
+        「git commit 失败」。保持函数返回普通数组、把规范化交给调用方。
+    #>
     param([Parameter(Mandatory)][string]$Root)
     $r = Invoke-GitCapture -Root $Root -GitArgs @('status', '--porcelain')
     if ($r.Code -ne 0 -or -not $r.Out) { return @() }
-    return @($r.Out -split "`r?`n" | Where-Object { $_ })
+    return ,@($r.Out -split "`r?`n" | Where-Object { $_ })
 }
 
 # ---------------------------------------------------------------------------
@@ -654,7 +673,11 @@ function Invoke-GitSyncPush {
         }
     }
 
-    $dirty = Get-GitSyncDirtyFiles -Root $Root
+    # @() 包一层：$dirty 可能是 $null（没有改动）或单个字符串（只有一项改动，
+    # PowerShell 会把单元素数组展开成标量）。严格模式下这两种情况访问 .Count
+    # 都会抛 PropertyNotFoundException —— 曾经就是这样：改动 ≥2 项时推送正常，
+    # 只有一项或没有改动时直接报「在此对象上找不到属性 Count」。
+    $dirty = @(Get-GitSyncDirtyFiles -Root $Root)
     $committed = $false
 
     if ($dirty.Count -gt 0) {
