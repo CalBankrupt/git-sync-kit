@@ -3,7 +3,7 @@
     git-sync-kit —— PowerShell 实现
 
     严格实现仓库根的 SPEC.md：
-      · 第 3 节  版本号与试验版（远端 VERSION 带 *）
+      · 第 3 节  版本号与发布约定（没升版 = 没发布）
       · 第 4 节  七态状态机
       · 第 5 节  JSON 契约
       · 第 6 节  六条安全约束
@@ -22,11 +22,15 @@
 
 Set-StrictMode -Version Latest
 
-$script:KitVersion   = '0.1.0'
+$script:KitVersion    = '0.2.0'
 $script:BranchDefault = 'main'
-$script:TrialSuffix  = '*'
-$script:DiffLimit    = 100
-$script:BackupDir    = '_backup_previous'
+$script:Modes         = @('update', 'sync')
+$script:DiffLimit     = 100
+$script:BackupDir     = '_backup_previous'
+
+# 多行文本统一用这个拼 —— PowerShell 自身的换行转义要写反引号 n，而本文件经手
+# 生成/编辑工具时反引号最容易出岔子，绕开它省心。
+$script:NL            = [char]10
 
 # ---------------------------------------------------------------------------
 # 内部工具
@@ -110,7 +114,7 @@ function Get-GitSyncLocalVersion {
         $text = (Get-Content -LiteralPath $vf -Raw -ErrorAction SilentlyContinue)
         if ($text) {
             $line = ($text -split "`r?`n")[0].Trim()
-            if ($line) { return $line.TrimEnd($script:TrialSuffix).Trim() }
+            if ($line) { return $line.Trim().TrimStart('v', 'V') }
         }
     }
     # 退路：pyproject.toml
@@ -142,10 +146,74 @@ function Get-GitSyncDirtyFiles {
 # ---------------------------------------------------------------------------
 # 远端探测
 # ---------------------------------------------------------------------------
+function Get-GitSyncAhead {
+    <#
+        本地领先远端多少个提交（SPEC 5.1 的 ahead）。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string]$Branch = $script:BranchDefault
+    )
+    $r = Invoke-GitCapture -Root $Root -GitArgs @('rev-list', '--count', "origin/${Branch}..HEAD")
+    if ($r.Code -eq 0 -and $r.Out -match '^\d+$') { return [int]$r.Out }
+    return 0
+}
+
+function Get-GitSyncConflict {
+    <#
+        冲突清单（SPEC 第 6 节）：以 merge-base 为基准，本地改过的文件与远端改过
+        的文件取交集。**只读，不动任何文件。**
+
+        没有分叉点就不存在冲突 —— 那种情况只有「落后」或「领先」。
+        返回 @{ count; files = @(@{ path; reason }) }。
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string]$Branch = $script:BranchDefault
+    )
+
+    $empty = @{ count = 0; files = @() }
+
+    $mb = Invoke-GitCapture -Root $Root -GitArgs @('merge-base', 'HEAD', "origin/${Branch}")
+    if ($mb.Code -ne 0 -or -not $mb.Out) { return $empty }
+    $base = ($mb.Out -split "`r?`n")[0].Trim()
+    if (-not $base) { return $empty }
+
+    $mine = @{}
+    $m = Invoke-GitCapture -Root $Root -GitArgs @('diff', '--name-only', $base, 'HEAD')
+    if ($m.Code -eq 0) {
+        foreach ($p in ($m.Out -split "`r?`n")) { if ($p) { $mine[$p.Trim()] = $true } }
+    }
+
+    # 工作区里未提交的也算「本地改过」
+    foreach ($line in (Get-GitSyncDirtyFiles -Root $Root)) {
+        $text = $(if ($line.Length -gt 3) { $line.Substring(3).Trim() } else { '' })
+        if ($text -match ' -> ') { $text = ($text -split ' -> ')[-1] }
+        if ($text) { $mine[$text.Trim('"')] = $true }
+    }
+
+    $common = New-Object System.Collections.ArrayList
+    $t = Invoke-GitCapture -Root $Root -GitArgs @('diff', '--name-only', $base, "origin/${Branch}")
+    if ($t.Code -eq 0) {
+        foreach ($raw in ($t.Out -split "`r?`n")) {
+            $p = $raw.Trim()
+            if ($p -and $mine.ContainsKey($p)) { [void]$common.Add($p) }
+        }
+    }
+
+    $sorted = @($common | Sort-Object)
+    return @{
+        count = $sorted.Count
+        files = @($sorted | ForEach-Object { @{ path = $_; reason = 'both-modified' } })
+    }
+}
+
 function Get-GitSyncRemote {
     <#
-        返回 @{ Version; Behind; Error; Mode }。版本号已去掉 *。
-        判断的是远端而不是本地 —— 标记由发布方打。
+        返回 @{ Version; Behind; Error }。0.2.0 起不再判试验版 —— 发布意图由
+        版本号表达（SPEC 第 3 节）。
     #>
     param(
         [Parameter(Mandatory)][string]$Root,
@@ -158,25 +226,24 @@ function Get-GitSyncRemote {
         # 原先只读 Err，于是界面显示成「git 通道失败：；HTTP 兜底也失败：…」——
         # 用户看不到 fatal: ... 到底是什么。
         $why = if ($f.Err) { $f.Err } elseif ($f.Out) { $f.Out } else { 'git fetch 失败' }
-        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why; Mode = 'release' }
+        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why }
     }
 
     $s = Invoke-GitCapture -Root $Root -GitArgs @('show', "origin/${Branch}:VERSION")
     if ($s.Code -ne 0 -or -not $s.Out) {
         # 与 fetch 失败分支同理：git 的原因在 Out 里（见 Invoke-GitCapture）。
         $why = if ($s.Err) { $s.Err } elseif ($s.Out) { $s.Out } else { "origin/${Branch} 上没有 VERSION 文件" }
-        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why; Mode = 'release' }
+        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why }
     }
 
     $raw = ($s.Out -split "`r?`n")[0].Trim()
-    $mode = if ($raw.EndsWith($script:TrialSuffix)) { 'trial' } else { 'release' }
-    $version = $raw.TrimEnd($script:TrialSuffix).Trim()
+    $version = $raw.TrimStart('v', 'V')
 
     $behind = 0
     $b = Invoke-GitCapture -Root $Root -GitArgs @('rev-list', '--count', "HEAD..origin/${Branch}")
     if ($b.Code -eq 0 -and $b.Out -match '^\d+$') { $behind = [int]$b.Out }
 
-    return [pscustomobject]@{ Version = $version; Behind = $behind; Error = ''; Mode = $mode }
+    return [pscustomobject]@{ Version = $version; Behind = $behind; Error = '' }
 }
 
 function Get-GitSyncRemoteHttp {
@@ -193,7 +260,7 @@ function Get-GitSyncRemoteHttp {
         $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 30
         $text = "$($resp.Content)".Trim()
         if (-not $text) { return [pscustomobject]@{ Version = $null; Error = '远端 VERSION 是空的' } }
-        $line = ($text -split "`r?`n")[0].Trim().TrimEnd($script:TrialSuffix).Trim()
+        $line = ($text -split "`r?`n")[0].Trim().TrimStart('v', 'V')
         return [pscustomobject]@{ Version = $line; Error = '' }
     }
     catch {
@@ -269,23 +336,25 @@ function Get-GitSyncDiff {
 # ---------------------------------------------------------------------------
 function Get-GitSyncReport {
     <#
-        跑一次检查，返回符合 SPEC 5.1 的对象。
+        跑一次检查，返回符合 SPEC 5.1 的对象（19 个字段）。
     #>
     [CmdletBinding()]
     param(
         [string]$Root = (Get-Location).Path,
         [string]$Branch = $script:BranchDefault,
-        [string]$Repo = ''
+        [string]$Repo = '',
+        [ValidateSet('update', 'sync')][string]$Mode = 'update'
     )
 
     $isGit = Test-Path -LiteralPath (Join-Path $Root '.git')
     $rep = [ordered]@{
-        ok = $true; state = 'unknown'; mode = 'release'
+        ok = $true; state = 'unknown'; workMode = $Mode
         local = Get-GitSyncLocalVersion -Root $Root
-        remote = $null; has_update = $false; behind = 0
+        remote = $null; has_update = $false; behind = 0; ahead = 0
         dirty = $false; is_git = $isGit; channel = 'none'
         branch = $Branch; message = ''; error = $null
-        can_install = $false; can_select = $false; diff = $null
+        can_install = $false; can_select = $false; can_push = $false
+        diff = $null; conflict = $null
     }
 
     if ($isGit) {
@@ -294,7 +363,6 @@ function Get-GitSyncReport {
         if ($remote.Version) {
             $rep.remote = $remote.Version
             $rep.behind = $remote.Behind
-            $rep.mode = $remote.Mode
             $rep.channel = 'git'
         }
         else {
@@ -316,51 +384,91 @@ function Get-GitSyncReport {
         $http = Get-GitSyncRemoteHttp -Repo $Repo -Branch $Branch
         if ($http.Version) {
             $rep.remote = $http.Version; $rep.channel = 'http'
+            $rep.has_update = (Test-VersionNewer -Candidate $http.Version -Current $rep.local)
+            $rep.state = $(if ($rep.has_update) { 'stale' } else { 'latest' })
+            $rep.message = $(if ($rep.has_update) {
+                "发现新版本 $($rep.remote)（当前 $($rep.local)）。此模式下只能查看，无法更新。"
+            } else { "已是最新版本（$($rep.local)）。" })
         }
         else {
             $rep.ok = $false; $rep.state = 'error'
             $rep.error = "不是 git 仓库，且 HTTP 查询失败：$($http.Error)"
             $rep.message = $rep.error
-            return [pscustomobject]$rep
-        }
-    }
-
-    # ---- 试验版：只看有没有差异 ----
-    if ($rep.mode -eq 'trial' -and $rep.channel -eq 'git') {
-        $d = Get-GitSyncDiff -Root $Root -Branch $Branch
-        $rep.diff = $d
-        $rep.has_update = ($d.count -gt 0)
-        if ($d.count -gt 0) {
-            $rep.state = 'trial'
-            $rep.message = "试验版（远端 VERSION 带 $($script:TrialSuffix)）：$($d.count) 个文件与远端有差异。`n" +
-                           '这种情况不会自动覆盖 —— 请挑要应用的文件，或先看清单再决定。'
-            $rep.can_select = $true
-        }
-        else {
-            $rep.state = 'latest'
-            $rep.message = "试验版（$($rep.local)），工作区与远端没有差异。"
         }
         return [pscustomobject]$rep
     }
 
-    # ---- 正式版：版本号变大才算有更新 ----
-    $rep.has_update = ($rep.remote -and (Test-VersionNewer -Candidate $rep.remote -Current $rep.local))
+    # ---- 冲突：只有真分叉（本地和远端各有提交）才可能 ----
+    if ($rep.channel -eq 'git') {
+        $rep.ahead = Get-GitSyncAhead -Root $Root -Branch $Branch
+        if ($rep.behind -gt 0 -and $rep.ahead -gt 0) {
+            $rep.conflict = Get-GitSyncConflict -Root $Root -Branch $Branch
+        }
+    }
+    $hasConflict = ($null -ne $rep.conflict -and $rep.conflict.count -gt 0)
+
+    # git 不通、只靠 HTTP 看到版本号 —— 判断不出该不该更新，如实说 unknown
     if ($rep.error) {
         $rep.state = 'unknown'
-    }
-    elseif ($rep.has_update) {
-        $rep.state = 'stale'
-        $tail = $(if ($rep.behind) { "，落后 $($rep.behind) 个提交" } else { '' })
-        $rep.message = "发现新版本 $($rep.remote)（当前 $($rep.local)$tail）。"
-    }
-    else {
-        $rep.state = 'latest'
-        $rep.message = "已是最新版本（$($rep.local)）。"
+        $rep.message = $rep.error
+        return [pscustomobject]$rep
     }
 
-    # SPEC 5.1：试验版永远不给一键更新
+    # ---- 按工作模式判定（SPEC 第 2 节）----
+    if ($Mode -eq 'sync') {
+        if ($rep.channel -eq 'git' -and $rep.behind -gt 0) {
+            $rep.has_update = $true
+            $rep.state = 'stale'
+            $rep.message = "远端有 $($rep.behind) 个提交未拉取。"
+        }
+        elseif ($rep.channel -eq 'git' -and $rep.ahead -gt 0) {
+            $rep.state = 'ahead'
+            $extra = $(if ($rep.dirty) { '有' } else { '无' })
+            $rep.message = "本地有 $($rep.ahead) 个提交未推送（工作区${extra}未提交改动）。"
+        }
+        elseif ($rep.dirty) {
+            $rep.state = 'ahead'
+            $rep.message = '工作区有未提交的改动，可以上传。'
+        }
+        else {
+            $rep.state = 'latest'
+            $rep.message = "已同步（$($rep.local)）。"
+        }
+    }
+    else {
+        $rep.has_update = [bool]($rep.remote -and (Test-VersionNewer -Candidate $rep.remote -Current $rep.local))
+        if ($rep.has_update) {
+            $rep.state = 'stale'
+            $tail = $(if ($rep.behind) { "，落后 $($rep.behind) 个提交" } else { '' })
+            $rep.message = "发现新版本 $($rep.remote)（当前 $($rep.local)$tail）。"
+        }
+        else {
+            $rep.state = 'latest'
+            $rep.message = "已是最新版本（$($rep.local)）。"
+        }
+    }
+
+    # ---- 差异清单：只要有得拉就算出来，与状态无关 ----
+    if ($rep.channel -eq 'git' -and $rep.behind -gt 0) {
+        $rep.diff = Get-GitSyncDiff -Root $Root -Branch $Branch
+        # SPEC 第 3 节的小补救：没升版也要让人知道，但状态位不打扰。
+        if ($Mode -eq 'update' -and $rep.state -eq 'latest') {
+            $rep.message += "远端另有 $($rep.behind) 个提交未升版 —— 打开窗口可以看差异。"
+        }
+    }
+
+    if ($hasConflict) {
+        $rep.message += "$($script:NL)注意：$($rep.conflict.count) 个文件本地和远端都改过，拉取与上传都已停用，请先手动处理。"
+    }
+
+    # SPEC 5.1：三个能力字段
     $rep.can_install = [bool](
-        $rep.channel -eq 'git' -and $rep.has_update -and -not $rep.dirty -and $rep.mode -eq 'release'
+        $rep.channel -eq 'git' -and $rep.has_update -and -not $rep.dirty -and -not $hasConflict
+    )
+    $rep.can_select = [bool]($rep.channel -eq 'git' -and $null -ne $rep.diff -and $rep.diff.count -gt 0)
+    $rep.can_push = [bool](
+        $Mode -eq 'sync' -and $rep.channel -eq 'git' -and -not $hasConflict -and
+        ($rep.ahead -gt 0 -or $rep.dirty)
     )
     return [pscustomobject]$rep
 }
