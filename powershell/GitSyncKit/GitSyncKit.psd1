@@ -6,7 +6,9 @@
     CompanyName       = 'CalBankrupt'
     Copyright         = '(c) CalBankrupt. MIT License.'
     Description       = 'git-sync-kit 的 PowerShell 实现：检查更新 / 安装更新 / 差异清单 / 选择性应用 / 双向同步。行为契约见仓库根的 SPEC.md。'
-    PowerShellVersion = '5.1'
+    # 只支持 PowerShell 7+：5.1 的默认执行策略常常拒绝加载模块，而退出码
+    # 仍是 0，表现为「命令跑完但什么都没输出」，排查成本比不支持更高。
+    PowerShellVersion = '7.0'
 
     FunctionsToExport = @(
         'Get-GitSyncRoot'

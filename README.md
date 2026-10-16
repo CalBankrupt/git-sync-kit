@@ -133,6 +133,52 @@ const seat = createStatusSeat({
 
 ---
 
+## 跨语言一致性测试
+
+`scripts/consistency.py` 把「三份实现输出同一份报告」从口头约定变成可执行的检查：
+
+```powershell
+python scripts/consistency.py
+python scripts/consistency.py --root "D:/my-project"     # 额外测一个真实仓库
+```
+
+它在临时目录里现造几个 git 仓库，各覆盖一种状态，用**本地裸仓库**当 origin ——
+全程离线，不碰任何真实远端，也不改你现有的仓库：
+
+| 夹具 | 覆盖的分支 |
+|---|---|
+| `latest` | 本地与远端同提交 |
+| `stale` | 远端版本号更高，本地落后 |
+| `trial` | 远端 VERSION 带 `*`，工作区与远端有差异 |
+| `dirty` | 有未提交的改动（拒绝更新的那条路） |
+| `no-remote` | 没有 origin —— git 通道必然失败 |
+| `no-version` | 远端没有 VERSION 文件（与 fetch 失败是两个错误出口） |
+
+每个夹具还会断言自己**造对了**（state / dirty / can_install 等），否则夹具造错
+会让「一致性测试」变成自我安慰。只比对只读的 `check()` —— `install` /
+`apply` 会动文件，不适合放进自动检查。
+
+> **它第一次跑就抓到三处真实漂移**，都是手工比对看不见的：
+>
+> 1. 「落后 N 个提交」这一句，Python 写在括号外，另外两份写在括号内；
+> 2. PowerShell 只读 `Err` 不看 `Out`，于是错误信息只剩一个冒号
+>    —— 它的 `2>&1` 把 stdout 和 stderr 合在了一起，git 的原因在 `Out` 里；
+> 3. Node 的 `show` 分支漏了 `out` 兜底，报的是笼统的「没有 VERSION 文件」
+>    而不是 git 的原话。
+
+### 对 PowerShell 的要求
+
+**只支持 PowerShell 7+（`pwsh`），不支持 Windows PowerShell 5.1。**
+
+5.1 的默认执行策略常常是 Restricted，`Import-Module` 会被直接拒绝，而
+**退出码仍然是 0** —— 表现为「命令跑完了，什么都没输出」，从现象很难倒推原因。
+控制台编码、`ConvertTo-Json` 对空值的处理也和 7 不一样，为它单独兜底不划算。
+
+脚本因此**只找 `pwsh`**，不退回 `powershell.exe`；`--ps` 指到 7 以下的
+版本会明确报错退出。
+
+---
+
 ## 怎么在项目里引用
 
 三种方式，按环境选：
@@ -205,10 +251,12 @@ git-sync-kit/
 │   ├── __init__.py
 │   └── core.py
 ├── powershell/GitSyncKit/
-│   ├── GitSyncKit.psm1         （UTF-8 BOM，PowerShell 5.1 需要）
+│   ├── GitSyncKit.psm1         （UTF-8 BOM，免得被按 ANSI 代码页读）
 │   └── GitSyncKit.psd1
-└── node/
-    └── index.mjs
+├── node/
+│   └── index.mjs
+└── scripts/
+    └── consistency.py          跨语言一致性测试（离线夹具 + 真实仓库）
 ```
 
 ---

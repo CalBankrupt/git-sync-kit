@@ -182,9 +182,14 @@ export class GitSyncKit {
     }
     const s = await runGit(this.root, ['show', `origin/${this.branch}:VERSION`])
     if (s.code !== 0 || !s.out) {
+      // runGit 把 stdout 和 stderr 一起写进同一个临时文件，所以真正的错误在
+      // out 里（err 只在 spawn 失败时才有值）。fetch 分支已经这么兜底了，这里
+      // 漏了 —— 于是用户看到「origin/main 上没有 VERSION 文件」，而 git 其实
+      // 说的是 fatal: path 'VERSION' does not exist in 'origin/main'。
+      // Python 那份读的是分离的 stderr，拿到的就是 git 的原话。
       return {
         version: null, behind: 0, mode: 'release',
-        error: s.err || `origin/${this.branch} 上没有 VERSION 文件`,
+        error: s.err || s.out || `origin/${this.branch} 上没有 VERSION 文件`,
       }
     }
     const raw = s.out.split(/\r?\n/)[0].trim()

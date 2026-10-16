@@ -405,9 +405,11 @@ class GitSyncKit:
             rep.state = "unknown"
         elif rep.has_update:
             rep.state = "stale"
-            head = f"发现新版本 {rep.remote}（当前 {rep.local}）"
-            tail = f"，落后 {rep.behind} 个提交" if rep.behind else ""
-            rep.message = f"{head}{tail}。"
+            # 「落后几个提交」放进括号里，与 PowerShell / Node 两份实现的文案逐字
+            # 对齐。这一点是 scripts/consistency.py 抓出来的：手工比对时没造出
+            # stale 状态，所以一直没人发现三份实现说的不是同一句话。
+            note = f"，落后 {rep.behind} 个提交" if rep.behind else ""
+            rep.message = f"发现新版本 {rep.remote}（当前 {rep.local}{note}）。"
         else:
             rep.state = "latest"
             rep.message = f"已是最新版本（{rep.local}）。"

@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.0
 <#
     git-sync-kit —— PowerShell 实现
 
@@ -12,8 +12,12 @@
     返回值一律是 PSCustomObject，字段名与 SPEC 第 5 节一致，可以直接
     ConvertTo-Json 交给界面。
 
-    注意：本文件必须以 UTF-8 BOM 保存。Windows PowerShell 5.1 按 ANSI
-    代码页读取无 BOM 的 .ps1/.psm1，中文注释会变成乱码并可能破坏解析。
+    要求 PowerShell 7+（pwsh）。**Windows PowerShell 5.1 不在支持范围内**：
+    它默认的执行策略常常直接拒绝加载模块，而退出码**仍然是 0** —— 表现出来
+    就是「命令跑完了，什么都没输出」，从现象很难倒推原因。
+
+    注意：本文件以 UTF-8 BOM 保存。少了 BOM，一些工具（以及 Windows
+    PowerShell 5.1）会按 ANSI 代码页读它，中文注释会变成乱码并可能破坏解析。
 #>
 
 Set-StrictMode -Version Latest
@@ -30,6 +34,13 @@ $script:BackupDir    = '_backup_previous'
 function Invoke-GitCapture {
     <#
         跑一条 git 命令，返回 @{ Code; Out; Err }。绝不抛异常。
+
+        注意 Out 里**混着 stdout 和 stderr**（PowerShell 的 2>&1 分不开这两者），
+        Err 只在 PowerShell 自己出错时才非空（比如找不到 git）。所以 git 返回
+        非 0 时，调用方要把 Out 也当作错误信息的来源 —— 只读 Err 的话，界面上
+        会出现「失败：」后面什么都没有。
+
+        取值顺序对齐 Python / Node 两份实现：err → out → 各自的兜底文案。
     #>
     [CmdletBinding()]
     param(
@@ -143,15 +154,18 @@ function Get-GitSyncRemote {
 
     $f = Invoke-GitCapture -Root $Root -GitArgs @('fetch', '--quiet', 'origin', $Branch) -TimeoutSeconds 120
     if ($f.Code -ne 0) {
-        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $f.Err; Mode = 'release' }
+        # git 自己失败时原因在 Out 里（见 Invoke-GitCapture 的说明）。
+        # 原先只读 Err，于是界面显示成「git 通道失败：；HTTP 兜底也失败：…」——
+        # 用户看不到 fatal: ... 到底是什么。
+        $why = if ($f.Err) { $f.Err } elseif ($f.Out) { $f.Out } else { 'git fetch 失败' }
+        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why; Mode = 'release' }
     }
 
     $s = Invoke-GitCapture -Root $Root -GitArgs @('show', "origin/${Branch}:VERSION")
     if ($s.Code -ne 0 -or -not $s.Out) {
-        return [pscustomobject]@{
-            Version = $null; Behind = 0
-            Error = "origin/${Branch} 上没有 VERSION 文件"; Mode = 'release'
-        }
+        # 与 fetch 失败分支同理：git 的原因在 Out 里（见 Invoke-GitCapture）。
+        $why = if ($s.Err) { $s.Err } elseif ($s.Out) { $s.Out } else { "origin/${Branch} 上没有 VERSION 文件" }
+        return [pscustomobject]@{ Version = $null; Behind = 0; Error = $why; Mode = 'release' }
     }
 
     $raw = ($s.Out -split "`r?`n")[0].Trim()
