@@ -10,11 +10,14 @@ Node）应当逐字段相同。这份脚本把那条约定变成可执行的检�
 --------
 1. **夹具**（默认）—— 在临时目录里现造几个 git 仓库，各自覆盖一种状态：
 
-   ==========  ==========================================================
-   `latest`      本地与远端同提交
-   `stale`       远端版本号更高，本地落后
-   `trial`       远端 VERSION 带 `*`，且工作区与远端有差异
-   ==========  ==========================================================
+   ============  ========================================================
+   `latest`       本地与远端同提交
+   `stale`        远端版本号更高，本地落后
+   `conflict`     真分叉：远端和本地都改过同一个文件
+   `dirty`        有未提交的改动
+   `no-remote`    没有 origin —— git 通道必然失败
+   `no-version`   远端没有 VERSION 文件
+   ============  ========================================================
 
    每个夹具都用**本地裸仓库**当 origin，全程离线，不碰任何真实远端，也不改
    你现有的任何仓库。
@@ -63,9 +66,9 @@ NL = chr(10)
 
 #: SPEC 5.1 规定的 16 个字段，顺序照 SPEC 里写的抄
 FIELDS = (
-    "ok", "state", "mode", "local", "remote", "has_update", "behind", "dirty",
-    "is_git", "channel", "branch", "message", "error", "can_install",
-    "can_select", "diff",
+    "ok", "state", "workMode", "local", "remote", "has_update", "behind",
+    "ahead", "dirty", "is_git", "channel", "branch", "message", "error",
+    "can_install", "can_select", "can_push", "diff", "conflict",
 )
 
 #: 提交夹具时用的身份，免得依赖机器上的 git config
@@ -216,14 +219,18 @@ def build_fixtures(base: Path) -> list[tuple[str, Path, dict]]:
 
     _, stale = bootstrap(base, "stale")
     push_second_version(stale, "2.0.0", "print('v1')")
+    # 差异清单现在常驻（不再限试验版），所以 stale 时 can_select 也为真
     made.append(("stale", stale, {"state": "stale", "has_update": True,
                                   "behind": 1, "can_install": True,
-                                  "can_select": False}))
+                                  "can_select": True}))
 
-    _, trial = bootstrap(base, "trial")
-    push_second_version(trial, "2.0.0*", "print('v2')")
-    made.append(("trial", trial, {"state": "trial", "mode": "trial",
-                                  "can_install": False, "can_select": True}))
+    # 真分叉：远端改过 app.py，本地也改过 app.py —— 冲突且两边都动不了
+    _, clash = bootstrap(base, "conflict")
+    push_second_version(clash, "2.0.0", "print('v2')")
+    write(clash / "app.py", "print('local edit')" + NL)
+    commit_all(clash, "本地改动")
+    made.append(("conflict", clash, {"state": "stale", "behind": 1, "ahead": 1,
+                                     "can_install": False, "can_push": False}))
 
     _, dirty = bootstrap(base, "dirty")
     write(dirty / "app.py", "print('local edit')" + NL)   # 只改，不提交
@@ -345,7 +352,8 @@ def run_suite(title: str, root: Path, runners: dict) -> bool:
         return False
 
     state = next(iter(states.values()), "?")
-    print(f"  {title}  —— 一致：16/16 字段，state={state}")
+    n = len(FIELDS)
+    print(f"  {title}  —— 一致：{n}/{n} 字段，state={state}")
     return True
 
 
