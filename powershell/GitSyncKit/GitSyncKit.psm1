@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+﻿#Requires -Version 7.0
 <#
     git-sync-kit —— PowerShell 实现
 
@@ -22,7 +22,7 @@
 
 Set-StrictMode -Version Latest
 
-$script:KitVersion    = '0.2.2'
+$script:KitVersion    = '0.2.3'
 $script:BranchDefault = 'main'
 $script:Modes         = @('update', 'sync')
 $script:DiffLimit     = 100

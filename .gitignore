@@ -12,6 +12,10 @@ package-lock.json
 # 应用差异时自动产生的备份（SPEC 6.2）—— 属于运行时数据，不入库
 _backup_previous/
 
+# Node 实现写 git 输出日志用的临时目录：系统临时目录不可写时会回退到这里
+_tmp/
+.gitsync-tmp/
+
 # 编辑器 / 系统
 .vscode/
 .idea/

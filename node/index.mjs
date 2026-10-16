@@ -9,17 +9,32 @@
  * · 任何公开动作都不抛异常，一律 resolve 出结构化结果（SPEC 6.6）
  * · 只用 ff-only，历史分叉宁可失败（SPEC 6.5）
  * · diff 比较工作区而不是 HEAD（SPEC 5.2，实测踩过）
- * · 子进程输出重定向到临时文件，不走 pipe
+ * · 子进程输出优先重定向到临时文件，建不了文件就退回 pipe
  *
- * 为什么不用 pipe：Windows 沙箱下 child_process 的 stdio:'pipe' 会因命名
- * 管道被拒而 EPERM。参考实现在这里踩过，所以统一重定向到临时文件。
+ * 关于子进程输出（2026-10-17 更正）
+ * ---------------------------------
+ * 原来这里写的是「Windows 沙箱下 stdio:'pipe' 会因命名管道被拒而 EPERM，
+ * 所以统一重定向到临时文件」。**那个归因是错的**：实测 pipe 一直好用，
+ * 真正报 EPERM 的是 `openSync(join(tmpdir(), ...))` —— 即**系统临时目录本身
+ * 不可写**（受限进程/沙箱下会这样），错误消息里的 `无法创建日志文件：EPERM`
+ * 正是这一条。原来把它读成了「pipe 失败」，于是换成了一个同样会失败、
+ * 却更难看出原因的做法。
+ *
+ * 现在按「能用就用、逐级回退」写：
+ *   1. TMPDIR 环境变量指定的目录
+ *   2. 系统临时目录（os.tmpdir()）
+ *   3. git-sync-kit 仓库自己的 _tmp/（开发机上最可能可写）
+ *   4. 当前工作目录下的 .gitsync-tmp/
+ *   5. 都不行 -> 用 pipe（连临时文件都建不了时，这是唯一还能走的路）
+ * 归一结果在进程内缓存，避免每条 git 命令都白试一遍。
  */
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, unlinkSync, openSync, closeSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-export const VERSION = '0.2.2'
+export const VERSION = '0.2.3'
 export const BRANCH_DEFAULT = 'main'
 export const TRIAL_SUFFIX = '*'
 export const DIFF_LIMIT = 100
@@ -29,29 +44,79 @@ export const BACKUP_DIR = '_backup_previous'
 // 工具
 // ---------------------------------------------------------------------------
 
-/** 跑一条 git 命令。输出走临时文件（见文件头说明），永不 reject。 */
+/** 候选的临时目录；null 代表「都不行，用 pipe」。归一结果缓存起来。 */
+let _logDirCache
+
+function _logDirCandidates() {
+  const fromEnv = process.env.TMPDIR || process.env.TMP || process.env.TEMP
+  // 本文件在 <仓库根>/node/ 下，所以仓库根是它上两级
+  let repoRoot = null
+  try {
+    repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+  } catch { /* 拿不到就跳过这一档 */ }
+  return [
+    fromEnv,
+    tmpdir(),
+    repoRoot ? join(repoRoot, '_tmp') : null,
+    join(process.cwd(), '.gitsync-tmp'),
+  ].filter(Boolean)
+}
+
+/**
+ * 挑一个能写文件的目录；都写不了就返回 null（调用方改用 pipe）。
+ *
+ * 为什么缓存：每条 git 命令都要这个目录，不缓存的话每条命令都要把不可写的
+ * 候选再试一遍，失败路径上的开销比成功路径还大。
+ */
+function _logDir() {
+  if (_logDirCache !== undefined) return _logDirCache
+  for (const dir of _logDirCandidates()) {
+    try {
+      mkdirSync(dir, { recursive: true })
+      const fd = openSync(join(dir, `gitsync-probe-${process.pid}.tmp`), 'w')
+      closeSync(fd)
+      try { unlinkSync(join(dir, `gitsync-probe-${process.pid}.tmp`)) } catch { /* 删不掉不影响 */ }
+      _logDirCache = dir
+      return dir
+    } catch {
+      continue
+    }
+  }
+  _logDirCache = null
+  return null
+}
+
+/** 跑一条 git 命令。输出走临时文件；建不了文件就退回 pipe。永不 reject。 */
 function runGit(root, args, timeoutMs = 90000) {
-  return new Promise((resolveResult) => {
-    const logPath = join(
-      tmpdir(),
-      `gitsynckit-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.log`,
-    )
-    let fd
+  const dir = _logDir()
+  const logPath = dir
+    ? join(dir, `gitsync-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.log`)
+    : null
+
+  let fd
+  if (logPath) {
     try {
       fd = openSync(logPath, 'w')
-    } catch (error) {
-      resolveResult({ code: 1, out: '', err: `无法创建日志文件：${error.message}` })
-      return
+    } catch {
+      fd = undefined   // 探测时能建、这次建不了：退回 pipe，不再重试探测
     }
+  }
+  const useFile = fd !== undefined
 
+  return new Promise((resolveResult) => {
+    let chunks = []
     let settled = false
     const finish = (payload) => {
       if (settled) return
       settled = true
-      try { closeSync(fd) } catch { /* 已经关了 */ }
       let log = ''
-      try { log = readFileSync(logPath, 'utf8') } catch { /* 读不到就算了 */ }
-      try { unlinkSync(logPath) } catch { /* 删不掉也不影响结果 */ }
+      if (useFile) {
+        try { closeSync(fd) } catch { /* 已经关了 */ }
+        try { log = readFileSync(logPath, 'utf8') } catch { /* 读不到就算了 */ }
+        try { unlinkSync(logPath) } catch { /* 删不掉也不影响结果 */ }
+      } else {
+        log = Buffer.concat(chunks).toString('utf8')
+      }
       resolveResult({ ...payload, out: (log || '').trim() })
     }
 
@@ -59,11 +124,16 @@ function runGit(root, args, timeoutMs = 90000) {
     try {
       child = spawn('git', ['-C', root, ...args], {
         windowsHide: true,
-        stdio: ['ignore', fd, fd],
+        stdio: useFile ? ['ignore', fd, fd] : ['ignore', 'pipe', 'pipe'],
       })
     } catch (error) {
       finish({ code: 1, err: `无法启动 git：${error.message}` })
       return
+    }
+
+    if (!useFile) {
+      child.stdout.on('data', (c) => chunks.push(c))
+      child.stderr.on('data', (c) => chunks.push(c))
     }
 
     const timer = setTimeout(() => {

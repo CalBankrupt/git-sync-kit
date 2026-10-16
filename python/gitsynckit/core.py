@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 BRANCH_DEFAULT = "main"
 
